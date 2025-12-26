@@ -1,106 +1,45 @@
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 from PIL import Image
 import numpy as np
 import os
 from io import BytesIO
-import requests
 import cv2
 
 # ==================== MODEL CLASSES ====================
-class PatchEmbedding(nn.Module):
-    def __init__(self, in_channels=1, embed_dim=128, patch_size=7):
-        super(PatchEmbedding, self).__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+class CNN(nn.Module):
+    def __init__(self):
+        super(CNN, self).__init__()
 
+        self.conv1 = nn.Conv2d(1, 10, 5)
+        self.conv2 = nn.Conv2d(10, 20, 5)
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(320, 50)
+        self.fc2 = nn.Linear(50, 10)
+    
     def forward(self, x):
-        x = self.proj(x)
-        x = x.flatten(2)
-        x = x.transpose(1, 2)
-        return x
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = self.conv2(x)
+        x = self.conv2_drop(x)
+        x = F.relu(F.max_pool2d(x, 2))
+        x = x.view(-1, 320)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.fc2(x)
 
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=128, attention_heads=8, dropout=0.1, mlp_dim=256):
-        super().__init__()
-        self.layer_norm_1 = nn.LayerNorm(embed_dim)
-        self.multi_head_attention = nn.MultiheadAttention(embed_dim, attention_heads, dropout, bias=True)
-        self.layer_norm_2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, mlp_dim),
-            nn.ReLU(),
-            nn.Linear(mlp_dim, embed_dim)
-        )
-
-    def forward(self, x):
-        x = x.transpose(0, 1)
-        residual_1 = x
-        x = self.layer_norm_1(x)
-        x = self.multi_head_attention(x, x, x)[0] + residual_1
-        residual_2 = x
-        x = self.layer_norm_2(x)
-        x = self.mlp(x) + residual_2
-        x = x.transpose(0, 1)
-        return x
-
-
-class MLPhead(nn.Module):
-    def __init__(self, embed_dim=128, mlp_dim=256):
-        super().__init__()
-        self.layer_norm_1 = nn.LayerNorm(embed_dim)
-        self.mlp_head = nn.Sequential(
-            nn.Linear(embed_dim, mlp_dim),
-            nn.Linear(mlp_dim, embed_dim)
-        )
-
-    def forward(self, x):
-        x = self.layer_norm_1(x)
-        x = self.mlp_head(x)
-        return x
-
-
-class VisionTransformer(nn.Module):
-    def __init__(self, img_size=28, patch_size=7, in_channels=1, num_classes=10,
-                 embed_dim=128, depth=6, num_heads=8, mlp_dim=256, dropout=0.1):
-        super(VisionTransformer, self).__init__()
-        self.patch_embed = PatchEmbedding(in_channels, embed_dim, patch_size)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.randn(1, (img_size // patch_size) ** 2 + 1, embed_dim))
-        self.transformer_blocks = nn.Sequential(*[TransformerEncoder(embed_dim, num_heads, dropout, mlp_dim) for _ in range(depth)])
-        self.mlp_head = MLPhead(embed_dim, mlp_dim)
-
-    def forward(self, x):
-        B = x.size(0)
-        x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        x = self.transformer_blocks(x)
-        x = x[:, 0]
-        x = self.mlp_head(x)
         return x
 
 
 @st.cache_resource
 def load_model(device):
-    """Load the trained model"""
-    model_config = {
-        'img_size': 28,
-        'patch_size': 7,
-        'in_channels': 1,
-        'num_classes': 10,
-        'embed_dim': 128,
-        'depth': 6,
-        'num_heads': 8,
-        'mlp_dim': 256,
-        'dropout': 0.1
-    }
+    """Load the trained CNN model"""
+    model = CNN().to(device)
     
-    model = VisionTransformer(**model_config).to(device)
-    
-    model_path = './trained_vit_mnist.pth'
+    model_path = './trained_CNN_mnist.pth'
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
     else:
@@ -112,34 +51,32 @@ def load_model(device):
 
 def predict_digit(image, model, device):
     """
-    ViT-appropriate MNIST-style preprocessing
+    MNIST-faithful preprocessing for CNN inference
     """
 
     # 1. Convert to grayscale
     image = image.convert("L")
+
+    # 2. Convert to numpy
     img = np.array(image, dtype=np.uint8)
 
-    # 2. Invert if background is white
+    # 3. Invert if background is white
     if img.mean() > 127:
         img = 255 - img
 
-    # 3. Light denoising (ViT prefers smoother signals)
-    img = cv2.GaussianBlur(img, (3, 3), 0)
+    # 4. Threshold (remove anti-aliasing & noise)
+    _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 4. Soft threshold (retain grayscale structure)
-    _, img = cv2.threshold(img, 0, 255,
-                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 5. Bounding box extraction
+    # 5. Find bounding box of digit
     coords = np.column_stack(np.where(img > 0))
     if coords.size == 0:
-        return None, 0.0, None
+        return None, 0.0, None  # empty canvas
 
     y0, x0 = coords.min(axis=0)
     y1, x1 = coords.max(axis=0) + 1
     img = img[y0:y1, x0:x1]
 
-    # 6. Pad to square (ViT is sensitive to aspect distortion)
+    # 6. Make image square by padding
     h, w = img.shape
     size = max(h, w)
     padded = np.zeros((size, size), dtype=np.uint8)
@@ -147,17 +84,16 @@ def predict_digit(image, model, device):
     x_offset = (size - w) // 2
     padded[y_offset:y_offset+h, x_offset:x_offset+w] = img
 
-    # 7. Resize to model input size
-    img = cv2.resize(padded, (28, 28),
-                     interpolation=cv2.INTER_AREA)
+    # 7. Resize to 28x28 (MNIST style)
+    img = cv2.resize(padded, (28, 28), interpolation=cv2.INTER_AREA)
 
-    # 8. Normalize
+    # 8. Convert to float and normalize
     img = img.astype(np.float32) / 255.0
 
-    # MNIST normalization (still important for ViT)
+    # MNIST normalization
     img = (img - 0.1307) / 0.3081
 
-    # 9. Tensor shape: [B, C, H, W]
+    # 9. Convert to tensor
     img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).to(device)
 
     # 10. Inference
@@ -220,7 +156,7 @@ def main():
     
     # Header
     st.markdown('<div class="main-title">🔢 MNIST Digit Recognizer</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">Powered by Vision Transformer</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Powered by Convolutional Neural Network (CNN)</div>', unsafe_allow_html=True)
     
     # Setup device and load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -332,22 +268,25 @@ def main():
         st.subheader("About This Application")
         
         st.write("""
-        ### 🔬 Vision Transformer Architecture
+        ### 🔬 Convolutional Neural Network (CNN) Architecture
         
-        This application uses a **Vision Transformer (ViT)** model trained on the MNIST dataset. 
-        The model converts images into patches and processes them using transformer-based attention mechanisms.
+        This application uses a **CNN** model trained on the MNIST dataset. 
+        The model uses convolutional layers to extract spatial features and fully connected layers for classification.
         
         **Model Architecture:**
-        - Patch Size: 7×7
-        - Embedding Dimension: 128
-        - Attention Heads: 8
-        - Transformer Layers: 6
-        - Dataset: MNIST (60,000 training images)
+        - **Conv Layer 1:** 1 input channel → 10 filters (5×5 kernel) + Max Pooling (2×2)
+        - **Conv Layer 2:** 10 filters → 20 filters (5×5 kernel) + Dropout + Max Pooling (2×2)
+        - **Dense Layer 1:** 320 units → 50 units (ReLU activation)
+        - **Dense Layer 2:** 50 units → 10 units (output logits)
+        - **Dataset:** MNIST (60,000 training images, 10,000 test images)
+        - **Optimizer:** Adam
+        - **Loss Function:** Cross Entropy Loss
         
         ### 📊 Model Performance
         - Trained on MNIST handwritten digits (0-9)
-        - Input image size: 28×28 pixels
+        - Input image size: 28×28 pixels (grayscale)
         - Works best with clear, centered digits
+        - Typical accuracy: 98%+
         
         ### 🎯 How to Use
         1. **Draw Tab**: Use your mouse to draw a digit in the canvas
